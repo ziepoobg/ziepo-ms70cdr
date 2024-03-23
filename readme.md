@@ -1,0 +1,1 @@
+Simple little scetch for the Raspberry Pi Pico to control the Zoom MS-70cdr multi effects unit.
