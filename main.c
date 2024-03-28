@@ -7,11 +7,11 @@
 #include "usb_midi_host.h"
 #include "button.h"
 
-#define DEBUG false
-const uint8_t NUM_BUTTONS = 8;
+#define DEBUG true
+const uint8_t NUM_BUTTONS = 9;
 const uint8_t dataSize = 146;
 
-const uint8_t led_pins[8] = {10, 11, 12, 13, 14, 15, 26, 27};
+const uint8_t led_pins[9] = {10, 11, 12, 13, 14, 15, 17, 16, 19};
 const uint8_t effectState_idx[6] = {6, 26, 47, 67, 88, 108};
 uint8_t syx_indetity_request[6] = {0xf0, 0x7e, 0x00, 0x06, 0x01, 0xf7};
 uint8_t syx_parameter_edit_enable[6] = {0xf0, 0x52, 0x00, 0x61, 0x50, 0xf7};
@@ -24,6 +24,8 @@ uint8_t syx_request_toggle_effect[10] = {0xf0, 0x52, 0x00, 0x61, 0x31, 0x00, 0x0
 
 // [5]=effect#, [6]=param#+2, [7]=value. value range is depends on each effect.
 uint8_t syx_parameter_edit[10] = {0xf0, 0x52, 0x00, 0x61, 0x31, 0x00, 0x00, 0x00, 0x00, 0xf7};
+
+uint8_t syx_tuner[3] = {0xb0, 0x4a, 0x00};
 
 typedef enum
 {
@@ -77,6 +79,7 @@ typedef enum
   PROGRAM_CHANGE_REQUEST,
   PROGRAM_CHANGE_PENDING,
   PROGRAM_CHANGE_RECEIVED,
+  CONTROL_CHANGE_REQUEST,
   CURRENT_PROGRAM_REQUEST,
   TOGGLE_EFFECT_STATE
 } core_task_t;
@@ -126,7 +129,7 @@ midi_device_t ms70cdr = {
 // holding device descriptor
 tusb_desc_device_t desc_device;
 
-led_state_t led_states[8] = {LOW};
+led_state_t led_states[9] = {LOW};
 bool sysex_complete = false;
 
 static bool device_mounted = false;
@@ -138,6 +141,7 @@ void handle_states_and_tasks();
 static void midi_host_task(void);
 void clone_descriptors(tuh_xfer_t *xfer);
 void send_sysex(uint8_t *message, int size);
+void send_control_change(uint8_t controller, uint8_t value, uint8_t channel);
 void send_program_change(uint8_t program, uint8_t channel);
 static void writeLEDs();
 static void btn_onchange(button_t *button_p);
@@ -172,6 +176,7 @@ int main()
   button_t *button6 = create_button(7, btn_onchange);
   button_t *button7 = create_button(8, btn_onchange);
   button_t *button8 = create_button(9, btn_onchange);
+  button_t *button9 = create_button(18, btn_onchange);
 
   while (1)
   {
@@ -208,12 +213,19 @@ static void btn_onchange(button_t *button_p)
         if (button->pin == 2)
         {
           // new_task = PROGRAM_CHANGE_REQUEST;
-          SetCurrentProgram(ms70cdr.program - 1);
+          SetCurrentProgram((ms70cdr.program <= 0 ? 49 : (ms70cdr.program - 1)));
         }
         else if (button->pin == 3)
         {
           // new_task = PROGRAM_CHANGE_REQUEST;
-          SetCurrentProgram(ms70cdr.program + 1);
+          SetCurrentProgram((ms70cdr.program >= 49 ? 0 : (ms70cdr.program + 1)));
+        }
+        else if (button->pin == 18)
+        {
+          // Toggle Tuner
+          syx_tuner[2] = syx_tuner[2] == 0x00 ? 0x7f : 0x00;
+          send_sysex(syx_tuner, 3);
+          led_states[8] = (syx_tuner[2] == 0x7f ? HIGH : LOW);
         }
         else
         {
@@ -256,10 +268,6 @@ void GetMaxEffects()
 
 void SetCurrentProgram(uint8_t program)
 {
-  if (program <= 1)
-    program = 1;
-  else if (program >= 49)
-    program = 49;
   ms70cdr.program = program;
   send_program_change(program, 1);
 }
@@ -585,14 +593,33 @@ void tuh_umount_cb(uint8_t daddr)
 }
 
 // Sends program change messages
+void send_control_change(uint8_t controller, uint8_t value, uint8_t channel)
+{
+  if (core0_state == WAITING)
+  {
+    if (core0_task == NONE)
+    {
+      core0_state = BUSY;
+      core0_task = CONTROL_CHANGE_REQUEST;
+
+      uint8_t packet[4] = {0x0b, (176 + channel), controller, value};
+      tuh_midi_packet_write(ms70cdr.addr, packet);
+      tuh_midi_stream_flush(ms70cdr.addr);
+
+      core0_state = WAITING;
+      core0_task = NONE;
+      new_task = CURRENT_PROGRAM_REQUEST;
+    }
+  }
+}
+
+// Sends program change messages
 void send_program_change(uint8_t program, uint8_t channel)
 {
   if (core0_state == WAITING)
   {
     if (core0_task == NONE)
     {
-      uint8_t data[2] = {(192 + channel), program};
-
       core0_state = BUSY;
       core0_task = PROGRAM_CHANGE_REQUEST;
 
@@ -684,8 +711,12 @@ void handle_sysex_rx_cb(uint8_t *packet, uint8_t cin)
       sysex.message[sysex.size++] = packet[i];
       if (packet[i] == 0xf7)
       {
-        // print_buffer(sysex.message, sysex.size, "Received Sysex");
+        if (DEBUG)
+          print_buffer(sysex.message, sysex.size, "Sysex received");
         sysex.status = COMPLETE;
+        if(sysex.size==15 && sysex.message[4] == 0x32){
+          SetCurrentProgram(sysex.message[8]);
+        }
         break;
       }
     }
@@ -694,12 +725,15 @@ void handle_sysex_rx_cb(uint8_t *packet, uint8_t cin)
 
 void handle_cc_rx_cb(uint8_t *packet)
 {
-  // if (DEBUG) printf("CC received\r\n");
+  if (DEBUG)
+    print_buffer(packet, 4, "CC received");
   //  Do nothing
 }
 
 void handle_pc_rx_cb(uint8_t *packet)
 {
+  if (DEBUG)
+    print_buffer(sysex.message, sysex.size, "PC received");
   pc_message.program = packet[2];
   pc_message.channel = (packet[1] & 0x0f) + 1;
   pc_message.status = COMPLETE;
